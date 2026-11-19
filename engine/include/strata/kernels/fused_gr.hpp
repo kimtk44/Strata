@@ -86,6 +86,8 @@ bool rdna_gr_enabled();
 bool rdna_gr_q8_requested();
 void rdna_gr_read_multi(const FusedGrArgs* a, int n_tok, float* scratch, void* stream,
                         unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
+/// xtx F03 (84b27e89): STRATA_GR_FUSED's grid-barrier words for the current device (at load, outside any capture).
+bool rdna_gr_init_device();
 /// n bf16 values (round to nearest even) of an r8 matrix of n elements into `out`, on `stream`.
 void rdna_r8_to_bf16(const int8_t* r8, uint16_t* out, long long n, void* stream);
 

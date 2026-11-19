@@ -554,6 +554,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             // down/up projections (and the final mixer's) for the RDNA read (rdna_gr.cu layout): the GGUF's Q8_0 as stored,
             // BF16 quantized per 32 on the stored fp16 scale, any other format the quant layer dequantizes likewise.
             // Only this stage's layers (as STRATA_HC_Q8's copies); the inject rows stay BF16.
+            if (gr_rdna_q8_build() && !strata::kernels::rdna_gr_init_device()) {   // xtx F03: STRATA_GR_FUSED's barrier
+                err = "native dense (STRATA_GR_RDNA_Q8): grid-barrier allocation"; return false;
+            }
             if (gr_rdna_q8_build())
                 for (const auto& tensor : gguf.tensors()) {
                     const bool other = tensor.type != 8 && tensor.type != 30 &&
