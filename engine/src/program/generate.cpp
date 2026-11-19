@@ -20622,10 +20622,17 @@ int main(int argc, char** argv) {
             // window's own commit inputs are intact in its parity's verifier).  Stage 1 never runs a speculative window
             // and a window row computes what it would in any other window, so every emitted token is the serial loop's
             // (with STRATA_IQ_MT_MIN=1 bit for bit; sampled requests with the same Philox draw per position).
+            // xtx (penalties under the pipeline): a request with repetition / frequency / presence penalties is pipelined
+            // too.  The penalties act only where the head's rows are sampled - the last stage, in pl_finish, after the
+            // window's graph - and the last stage never runs a speculative window: when a window is launched there every
+            // window before it has its verdict and its tokens are in `consumed`, so the history rows staged right before
+            // that launch (see "the last stage" below) are the serial loop's, token for token.  The front stages read no
+            // history.  STRATA_PL_PENALTY=0 brings the serial fallback back (the behaviour before this change).
+            static const bool pl_pen_on = [] { const char* v = std::getenv("STRATA_PL_PENALTY"); return v == nullptr || v[0] != '0'; }();
             bool pl_ran = false;
             const bool pl_want = pipe && pl_pw >= 2 && pl_snap_ok;
             const char* pl_serial = !pl_want ? nullptr
-                                  : hist_n > 0 ? "repetition penalties (penalty_last_n)"
+                                  : hist_n > 0 && !pl_pen_on ? "repetition penalties (penalty_last_n; STRATA_PL_PENALTY=0)"
                                   : mtp.coupled() ? "coupled draft sampling" : nullptr;
             if (pl_serial != nullptr) {   // said once per reason
                 static std::set<std::string> said;
@@ -20672,12 +20679,16 @@ int main(int argc, char** argv) {
                 // 0.8: 0.5-0.6 was on the path 4 times in 10) with the weight of 24 windows a row, and halves a row's
                 // counts past 512 so that it keeps following.
                 struct PlCal { double n[11], on[11]; };
-                static PlCal pl_cal = [] {
+                // xtx: two tables - [0] requests without penalties, [1] requests with them.  The drafter's guess of a
+                // window's bonus token knows nothing of the penalties (outside coupled sampling), so a penalised request
+                // is on the path less often at the same estimate; its windows must not pull the other requests' gate down.
+                static std::array<PlCal, 2> pl_cal_tab = [] {
                     static const double prior[11] = {0.02, 0.06, 0.11, 0.18, 0.27, 0.38, 0.48, 0.60, 0.75, 0.92, 0.75};
                     PlCal c{};
                     for (int i = 0; i < 11; ++i) { c.n[i] = 24.0; c.on[i] = 24.0 * prior[i]; }
-                    return c;
+                    return std::array<PlCal, 2>{c, c};
                 }();
+                PlCal& pl_cal = pl_cal_tab[hist_n > 0 ? 1 : 0];
                 auto cal_row = [](float p_on, bool lookup) { return lookup ? 10 : std::min(9, std::max(0, (int) (p_on * 10.0f))); };
                 auto gate_pass = [&](float p_on, bool lookup) {
                     if (theta >= 0.0f) return p_on >= theta;
@@ -21176,6 +21187,20 @@ int main(int argc, char** argv) {
                     if (A.finished && !A.s1) {
                         if (chain_kind == 1 && !B.ready) ++pl_late;   // stage 0 idles until the chain has B
                         if (ajob) a_gap(1);   // --adapt-async: stage 1 is idle until this launch
+                        if (hist_n > 0) {
+                            // xtx: the penalty tails of A's rows, as the serial loop stages them before a window: one per
+                            // row, over what the state has consumed (`consumed` holds every token before A's row 0 - the
+                            // window before A has its verdict and its commit pushed them), A's head and its drafts before
+                            // that row.  Read by pl_finish's sampling of this window only: the window before was sampled
+                            // (and synchronized) at its verdict, and no other window is on the last stage meanwhile.
+                            if ((size_t) A.T * (size_t) hist_n > hist_stage.size()) return die("the penalty history does not hold this window");
+                            strata::kernels::penalty_rows(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0), A.tok, A.T,
+                                                          hist_n, hist_stage.data());
+                            const strata::core::OnDevice on_h(hist_dev);
+                            if (cudaMemcpy(d_hist, hist_stage.data(), (size_t) A.T * (size_t) hist_n * sizeof(int32_t),
+                                           cudaMemcpyHostToDevice) != cudaSuccess)
+                                return die("the penalty history upload failed");
+                        }
                         if (!V1(A).pl_launch(A.T, A.tok, A.p, err)) return die(err);
                         A.s1 = true;
                         tre("L1", A.seq, A.T);
@@ -21427,7 +21452,8 @@ int main(int argc, char** argv) {
                         std::snprintf(b, sizeof b, " %.2f", pl_cal.on[i] / pl_cal.n[i]);
                         cal += b;
                     }
-                    std::fprintf(stderr, "strata pipeline gate table (on-path share by p_on decile, then lookups):%s\n", cal.c_str());
+                    std::fprintf(stderr, "strata pipeline gate table%s (on-path share by p_on decile, then lookups):%s\n",
+                                 hist_n > 0 ? " for requests with penalties" : "", cal.c_str());
                 }
             }
 #if defined(STRATA_HAVE_DFLASH2)
