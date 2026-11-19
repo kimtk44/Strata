@@ -6,7 +6,7 @@ upstream v0.2.16 + selectively ported nicejunjie/Strata-rdna3 patches (not a reb
 
 ## Layout
 - Repo: ~/workspace/dev/strata-fork (origin = kimtk44/Strata, upstream = Niko1221/Strata, nj = nicejunjie/Strata-rdna3, blobless clone: avoid `git log -S`)
-- Branches: `xtx` = v0.2.16 (64524fb9) · `xtx-f04-pcie-off` = F04 + hardening (23cb6c7d, 9f6b0b6b) · `xtx-f02-rdna-decode` = F02/F03 port in progress (worktree ~/workspace/dev/strata-fork-f02, agent)
+- Branches: `xtx` = v0.2.16 (64524fb9) · `xtx-f04-pcie-off` = F04 + hardening (23cb6c7d, 9f6b0b6b) · `xtx-f02-rdna-decode` = F02/F03 ported on top of F04 (4e8b013d, 0bd340a3; built, not yet run; worktree ~/workspace/dev/strata-fork-f02)
 - Build: `cmake -S engine -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DCMAKE_HIP_ARCHITECTURES=gfx1100 -DCMAKE_PREFIX_PATH=/opt/rocm -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++` (needs the prefix/compiler flags; engine reports 0.1.62)
 - Setup config isolation: `XDG_CONFIG_HOME=$PWD/.xdg` (keeps the old v0.1.41 install in ~/workspace/dev/playground/strata untouched). `./setup.sh --check --backend hip`: IQ3_S needs ~84 GB RAM+VRAM -> fits.
 - Model: ISTA-DASLab GSQ-RCO IQ3_S -> ~/llm/models/strata-data/models/IQ3_S/ (2 shards, 51.05 + 26.82 GiB; sha256 to check against HF lfs oid). Pack to build fresh with v0.2.16 `terminal/tools/iq_pack.py --experts-bin` (v0.2.16 rejects pre-v2 packs).
@@ -38,4 +38,4 @@ hardening applied. Not hooked: the one-shot `--spec` program path (keeps the ful
 ## Next
 1. sha256 check, IQ3_S pack (+ MTP runtime) with v0.2.16 tools.
 2. gpu-lock both cards (user OK'd now), empty llama-swap, measure: 1 card upstream default / 1 card step-0 / 2-card layer split F04 off vs on.
-3. F02/F03 A/B when the agent's branch lands; then F05/F09, F10 check, TP chain (F12 -> F13/F15/F16) with the fixes above.
+3. F02/F03 A/B (all env switches default off; build-time `-DSTRATA_DPP_SHFL=ON` separate dir). Order: all off = token-match baseline -> `STRATA_RDNA_Q6K=1` (+PAIR/IQ3S/KQ_ALL) -> `STRATA_GR_RDNA=1` (+`_Q8` look for "BF16 copies skipped", +`_A8`) -> `STRATA_GR_INJ_UP=1` -> `STRATA_GR_FUSED=1` on 1 card, no `--pipeline-windows 2` (grid barrier has no timeout, needs 168 blocks resident; fork saw a layer-26 hang) -> `STRATA_ROUTE_PUBLISH=1`, `STRATA_COMBINE_CPU=1` (+`STRATA_WAIT_FUSE=1`, `STRATA_MMVF_ROWS=1`), compare vs upstream `STRATA_FUSE_WAIT`/`FUSE_HITS`. Caveats: RDNA kernels change summation order (not bitwise), r8 hc copies not in the VRAM estimate and pure extra on layer split. Then F05/F09, F10 check, TP chain (F12 -> F13/F15/F16) with the fixes above.
