@@ -36,6 +36,6 @@ hardening applied. Not hooked: the one-shot `--spec` program path (keeps the ful
 - DP prefill (upstream PR #5002 = fork F10) needs every expert in RAM -> likely not on 64 GB with IQ3_S.
 
 ## Next
-1. sha256 check, IQ3_S pack (+ MTP runtime) with v0.2.16 tools.
+1. DONE 11-19: IQ3_S verified, packed, first 5 arms measured -> xtx-notes/bench-2026-11-19-iq3s.md
 2. gpu-lock both cards (user OK'd now), empty llama-swap, measure: 1 card upstream default / 1 card step-0 / 2-card layer split F04 off vs on.
 3. F02/F03 A/B (all env switches default off; build-time `-DSTRATA_DPP_SHFL=ON` separate dir). Order: all off = token-match baseline -> `STRATA_RDNA_Q6K=1` (+PAIR/IQ3S/KQ_ALL) -> `STRATA_GR_RDNA=1` (+`_Q8` look for "BF16 copies skipped", +`_A8`) -> `STRATA_GR_INJ_UP=1` -> `STRATA_GR_FUSED=1` on 1 card, no `--pipeline-windows 2` (grid barrier has no timeout, needs 168 blocks resident; fork saw a layer-26 hang) -> `STRATA_ROUTE_PUBLISH=1`, `STRATA_COMBINE_CPU=1` (+`STRATA_WAIT_FUSE=1`, `STRATA_MMVF_ROWS=1`), compare vs upstream `STRATA_FUSE_WAIT`/`FUSE_HITS`. Caveats: RDNA kernels change summation order (not bitwise), r8 hc copies not in the VRAM estimate and pure extra on layer split. Then F05/F09, F10 check, TP chain (F12 -> F13/F15/F16) with the fixes above.
