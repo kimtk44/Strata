@@ -227,7 +227,11 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         x_q8_1 = nw.q8_1;
     }
     // S26 STRATA_LFUSE (gate_deferred): gate and up in one launch where the pair applies (bitwise the two calls)
-    if (!(pair && nw.gate_type == nw.up_type &&
+    // xtx F02 (9ea97232) STRATA_RDNA_PAIR: gate and up in one RDNA GEMV launch when they share a format the RDNA kernels
+    // take (bitwise the two RDNA calls); off: false, nothing launched
+    const bool rpair = nw.gate_type == nw.up_type &&
+        rdna_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff, (int) n_ff, n_tok, stream);
+    if (!rpair && !(pair && nw.gate_type == nw.up_type &&
           native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff, n_tok, stream))) {
         native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
         native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);

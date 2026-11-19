@@ -3574,14 +3574,42 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     case 8: native_q8_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 20: native_iq4_nl_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 11: native_q3_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 12: native_q4_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 13: native_q5_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 14: native_q6_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 23: native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    // xtx F02 (f7fc223b, 45c107ef): STRATA_RDNA_Q6K=1 (gfx11) takes the RDNA multi-column kernels where they apply
+    case 12:
+        if (rdna_q6k_enabled() && rdna_kq_mmvq(12, weights, x_q8_1, y, n_in, n_out, ncols, stream)) break;
+        native_q4_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 13:
+        if (rdna_q6k_enabled() && rdna_kq_mmvq(13, weights, x_q8_1, y, n_in, n_out, ncols, stream)) break;
+        native_q5_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 14:
+        if (rdna_q6k_enabled() && rdna_q6k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) break;
+        native_q6_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 23:
+        if (rdna_q6k_enabled() && rdna_kq_mmvq(23, weights, x_q8_1, y, n_in, n_out, ncols, stream)) break;
+        native_iq4_xs_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 42: native_q2_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 16: case 17: case 18: case 21: case 22: case 29:
+    case 21:   // IQ3_S: the RDNA multi-column kernel under STRATA_RDNA_IQ3S=1 (xtx F02 45c107ef; slower than native at T>=2 there)
+        {
+            static const bool iq3s = [] { const char* v = std::getenv("STRATA_RDNA_IQ3S"); return v != nullptr && v[0] == '1'; }();
+            if (iq3s && rdna_q6k_enabled() && rdna_kq_mmvq(21, weights, x_q8_1, y, n_in, n_out, ncols, stream)) break;
+        }
+        iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 16: case 17: case 18: case 22: case 29:
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
+    }
+}
+
+// xtx F02 (9ea97232) STRATA_RDNA_PAIR=1
+bool rdna_mmvq_pair(int type, const void* w1, const void* w2, const void* xq, float* y1, float* y2, int n_in,
+                    int n_out1, int n_out2, int ncols, void* stream) {
+    static const bool on = [] { const char* v = std::getenv("STRATA_RDNA_PAIR"); return v != nullptr && v[0] == '1'; }();
+    if (!on || !rdna_q6k_enabled() || !w1 || !w2 || !xq || !y1 || !y2) return false;
+    // only where each matrix's own native_mmvq call would take these same rdna kernels
+    switch (type) {
+        case 14: return rdna_q6k_mmvq2(w1, xq, y1, n_in, n_out1, ncols, stream, w2, y2, n_out2);
+        case 12: case 13: case 23: return rdna_kq_mmvq2(type, w1, xq, y1, n_in, n_out1, ncols, stream, w2, y2, n_out2);
+        default: return false;
     }
 }
 

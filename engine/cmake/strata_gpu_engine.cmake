@@ -86,6 +86,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/kv_stream.cu
                           src/kernels/cuda/kv_q4.cu
                           src/kernels/cuda/fused_gr.cu
+                          src/kernels/cuda/rdna_gr.cu   # xtx F02: STRATA_GR_RDNA (gfx11; stubs elsewhere)
+                          src/kernels/cuda/rdna_mmvq.cu # xtx F02: STRATA_RDNA_Q6K / _PAIR / _IQ3S (gfx11; stubs elsewhere)
                           src/kernels/cuda/cvec.cu
                           src/kernels/cuda/qsa_decode_attn.cu
                           src/kernels/cuda/qsa_prompt_attn.cu

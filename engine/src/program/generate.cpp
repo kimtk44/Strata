@@ -160,6 +160,8 @@
 #define NOMINMAX   // gguf_reader.hpp includes windows.h
 #endif
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/quant/dequant.hpp"   // xtx F02: the STRATA_GR_RDNA_Q8 skip scan (which hc formats get int8 copies)
+#include "strata/quant/types.hpp"
 #include "strata/core/family_layout.hpp"
 #if defined(STRATA_HAVE_QWEN35)
 #include "strata/qwen35/engine.hpp"
@@ -5517,6 +5519,33 @@ int main(int argc, char** argv) {
         // quantizes them from the pack file), so their bf16 copy is not loaded
         if (!o.native_dense_gguf.empty() && !multi_gpu && strata::core::NativeDense::hc_q8_requested())
             strata::core::NativeDense::add_hc_skip(o.pack, skip);
+        // xtx F02 (e25a7b45, 404247f8) STRATA_GR_RDNA=1 + STRATA_GR_RDNA_Q8=1 (single GPU, as STRATA_HC_Q8's skip above): the
+        // layers' hyper-connection down/up projections are served by their int8 copies (the verify read) and dequantized on
+        // demand elsewhere (NativeDense::hc_bf16_view), so their BF16 copies stay off the card.  Only the tensors NativeDense
+        // turns into int8 copies (GGUF Q8_0, BF16 or a format the quant layer dequantizes; 2-D, ne0 % 32 == 0).
+        if (!o.native_dense_gguf.empty() && !multi_gpu && !strata::core::NativeDense::hc_q8_requested() &&
+            strata::kernels::rdna_gr_q8_requested() && strata::kernels::rdna_gr_enabled()) {
+            try {
+                size_t n_skip = 0;
+                for (const auto& path : o.native_dense_gguf) {
+                    strata::GgufFile gguf(path);
+                    for (const auto& t : gguf.tensors()) {
+                        const auto* ti = strata::quant::type_info((int) t.type);
+                        const bool other = t.type != 8 && t.type != 30 && ti != nullptr && ti->blck > 0 &&
+                                           strata::quant::can_dequant((strata::quant::Type) t.type) && t.shape.size() == 2 &&
+                                           t.shape[0] % (uint64_t) ti->blck == 0;
+                        if (t.name.rfind("blk.", 0) != 0 || (t.type != 8 && t.type != 30 && !other) || t.shape.size() != 2 ||
+                            t.shape[0] % 32 != 0)
+                            continue;
+                        for (const char* nm : {".hc_attn_down.weight", ".hc_attn_up.weight", ".hc_ffn_down.weight", ".hc_ffn_up.weight"})
+                            if (t.name.ends_with(nm) && skip.insert(t.name).second) ++n_skip;
+                    }
+                }
+                std::fprintf(stderr, "strata generate: STRATA_GR_RDNA_Q8=1: %zu hyper-connection BF16 copies skipped (int8 copies serve them)\n", n_skip);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "strata generate: STRATA_GR_RDNA_Q8 skip scan: %s (BF16 copies kept)\n", e.what());
+            }
+        }
     }
     // Layer split: every GPU holds only the dense weights of ITS layers (the PLE tensors stay everywhere).
     // Without this each card keeps a full copy (~3.4 GB for the Coder) that its stage never reads - VRAM the

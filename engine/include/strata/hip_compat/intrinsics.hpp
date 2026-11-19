@@ -115,10 +115,51 @@ __device__ __forceinline__ void syncwarp(uint32_t mask = 0xffffffffu) {
 }
 #endif
 
+// xtx F02 (nicejunjie/Strata-rdna3 3557322d), opt-in at build time (-DSTRATA_DPP_SHFL=ON -> STRATA_DPP_SHFL_BUILD): on gfx11
+// wave32, xor shuffles by DPP row_xmask (1/2/4/8) and v_permlanex16 (16) - the same butterfly partner, so the same bits -
+// instead of ds_bpermute's LDS round trip.  Without the switch (the default) shfl_xor_fast is __shfl_xor, as upstream.
+#if defined(STRATA_DPP_SHFL_BUILD) && (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+     defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__))
+__device__ __forceinline__ int dpp_xor32(int v, int m) {
+    switch (m) {
+        case 1: return __builtin_amdgcn_update_dpp(0, v, 0x161, 0xf, 0xf, false);
+        case 2: return __builtin_amdgcn_update_dpp(0, v, 0x162, 0xf, 0xf, false);
+        case 4: return __builtin_amdgcn_update_dpp(0, v, 0x164, 0xf, 0xf, false);
+        case 8: return __builtin_amdgcn_update_dpp(0, v, 0x168, 0xf, 0xf, false);
+        case 16: return __builtin_amdgcn_permlanex16(0, v, 0x76543210, 0xfedcba98, false, false);
+        default: return __shfl_xor(v, m, 32);
+    }
+}
+template <typename T>
+__device__ __forceinline__ T shfl_xor_fast(T value, int lane_mask, int width = 32) {
+    if constexpr (sizeof(T) == 4) {
+        if (lane_mask < width && width <= 32) {
+            int b; __builtin_memcpy(&b, &value, 4);
+            b = dpp_xor32(b, lane_mask);
+            T r; __builtin_memcpy(&r, &b, 4);
+            return r;
+        }
+    } else if constexpr (sizeof(T) == 8) {
+        if (lane_mask < width && width <= 32) {
+            int b[2]; __builtin_memcpy(b, &value, 8);
+            b[0] = dpp_xor32(b[0], lane_mask); b[1] = dpp_xor32(b[1], lane_mask);
+            T r; __builtin_memcpy(&r, b, 8);
+            return r;
+        }
+    }
+    return __shfl_xor(value, lane_mask, width);
+}
+#else
+template <typename T>
+__device__ __forceinline__ T shfl_xor_fast(T value, int lane_mask, int width = 32) {
+    return __shfl_xor(value, lane_mask, width);
+}
+#endif
+
 template <typename T>
 __device__ __forceinline__ T shfl_xor_sync(uint32_t mask, T value, int lane_mask, int width = 32) {
     require_full_wave_mask(mask);
-    return __shfl_xor(value, lane_mask, width);
+    return shfl_xor_fast(value, lane_mask, width);   // xtx F02: __shfl_xor unless STRATA_DPP_SHFL_BUILD
 }
 
 template <typename T>
