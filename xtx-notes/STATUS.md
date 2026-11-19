@@ -1,0 +1,41 @@
+# xtx fork status (2026-11-19)
+
+Our fork of Niko1221/Strata for 2x RX 7900 XTX (gfx1100), Ryzen 5 3600 (Zen 2, AVX2, no AVX-512),
+64 GB DDR4-3200 (~54 GiB available), system ROCm 7.2.4, kernel 6.8. Base decision (user, 11-19):
+upstream v0.2.16 + selectively ported nicejunjie/Strata-rdna3 patches (not a rebase of the rdna3 fork).
+
+## Layout
+- Repo: ~/workspace/dev/strata-fork (origin = kimtk44/Strata, upstream = Niko1221/Strata, nj = nicejunjie/Strata-rdna3, blobless clone: avoid `git log -S`)
+- Branches: `xtx` = v0.2.16 (64524fb9) · `xtx-f04-pcie-off` = F04 + hardening (23cb6c7d, 9f6b0b6b) · `xtx-f02-rdna-decode` = F02/F03 port in progress (worktree ~/workspace/dev/strata-fork-f02, agent)
+- Build: `cmake -S engine -B build-hip -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DCMAKE_HIP_ARCHITECTURES=gfx1100 -DCMAKE_PREFIX_PATH=/opt/rocm -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++` (needs the prefix/compiler flags; engine reports 0.1.62)
+- Setup config isolation: `XDG_CONFIG_HOME=$PWD/.xdg` (keeps the old v0.1.41 install in ~/workspace/dev/playground/strata untouched). `./setup.sh --check --backend hip`: IQ3_S needs ~84 GB RAM+VRAM -> fits.
+- Model: ISTA-DASLab GSQ-RCO IQ3_S -> ~/llm/models/strata-data/models/IQ3_S/ (2 shards, 51.05 + 26.82 GiB; sha256 to check against HF lfs oid). Pack to build fresh with v0.2.16 `terminal/tools/iq_pack.py --experts-bin` (v0.2.16 rejects pre-v2 packs).
+- Patch inventory: patch-inventory-2026-11-19.md (25 families, step-0 config, port order).
+
+## F04 (done, built, reviewed)
+`--pcie-frac 0` skips the PCIe share path in every verify window incl. layer-split stages and pipelined odd windows
+(fork: IQ3 dual 123.0 -> 136.2, IQ4 114.0 -> 124.1). Guards: no auto share, no peer device, no ADAPT_FETCH,
+set_pcie_balance forces the path on, request pcie_frac held at 0 (one-time warning), and GpuPlanSink::pcie_off makes
+the pool itself plan no PCIe groups. A/B in one binary: `STRATA_PCIE_OFF=0`. Independent Fable review: sound;
+hardening applied. Not hooked: the one-shot `--spec` program path (keeps the full graph).
+
+## Step-0 config notes (from inventory)
+- Use hipBLASLt table gfx1100-hipblaslt-100202.txt (system ROCm 7.2.4), not the fork's 100200.
+- STRATA_PF_F16=1 (value 2 is read as off upstream). `--tensor-parallel` does not exist upstream.
+- Retune for Zen 2 / 64 GB: --pool-workers 6, PREFILL_CPU_SHARE unset or auto, --conversation-cache-mib 0-2048.
+- Korean user's "main optimized" four: hipBLASLt table + --pcie-frac 0 + STRATA_GDN_CHUNKED=1 + --adapt-every 1 (decode 64 -> 71, read 952 -> 1,790 on one 7900 XTX).
+
+## Two-card findings (web research 11-19, verified items marked)
+- Our box (verified): ReBAR on (BAR0 32G both), KFD p2p_links present between the two GPUs (type 2, weight 40), PSU 1200 W Platinum (dual full load ~720 W measured earlier).
+- v0.2.14 trims each stage to its own dense weights; v0.2.16 merged pipelined two-card decode (#5860/#5862/#5864).
+- `--peer-device` can fault on the first request (~4% of fresh starts, release notes) -> not used.
+- Closest hardware report: Strata #6202 (5700X AM4, 64 GB DDR4, x8+x8, 2x 7800 XT): IQ3_S full RAM+VRAM residency, prompt 941 (4K) -> 2,494 (128K), decode 53-56. If RAM runs short: HSA_USERPTR_FOR_PAGED_MEM=0, STRATA_RESIDENT_PIN=0, GPU_PINNED_MIN_XFER_SIZE=1048576 (else 5-37 s pauses).
+- Strata #4136 (2x 7900 XTX, one on chipset x4): IQ3_S 262K, layer-split 26, pipeline-windows 2, trim-stage-weights, spec-min-p 0.7 -> decode 66-71, prefill 1,781-2,168. --batch / PARALLEL=2 disables pipelined decode and evicts ~40% of the cache.
+- Avalon two AMD cards: #55 decode 84-97 on 2x 7900 XTX x8/x8 (kernel 6.14); #20 two cards slower than one in layer-device mode; #26 host-sync limit open.
+- rdna3 fork TP issues on our stack: #14 STRATA_REFILL_SDMA must be 0 on kernel 6.8 (else 30 s stalls; with it off decode 133-147), #16 raise STRATA_WATCHDOG_S to ~180 for huge prompts, #17 cards stuck at 100 W after first big request, #18 megakernel stall. Port TP after the layer-split baseline, applying these fixes as defaults.
+- DP prefill (upstream PR #5002 = fork F10) needs every expert in RAM -> likely not on 64 GB with IQ3_S.
+
+## Next
+1. sha256 check, IQ3_S pack (+ MTP runtime) with v0.2.16 tools.
+2. gpu-lock both cards (user OK'd now), empty llama-swap, measure: 1 card upstream default / 1 card step-0 / 2-card layer split F04 off vs on.
+3. F02/F03 A/B when the agent's branch lands; then F05/F09, F10 check, TP chain (F12 -> F13/F15/F16) with the fixes above.
