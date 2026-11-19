@@ -12954,6 +12954,21 @@ int main(int argc, char** argv) {
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        // xtx F04 (nicejunjie deafb0d3 + 3557322d): --pcie-frac 0 means the pool plans no PCIe share, so every verify
+        // window (one card, each layer-split stage, the pipelined odd windows) skips the flag-B wait, the fetch and the
+        // empty PCIe launch. Guards: no auto share, no peer device, no STRATA_ADAPT_FETCH (it rides the PCIe fetch),
+        // STRATA_PCIE_OFF=0 turns it off; while on, a request's own pcie_frac is held at 0 (below).
+        const bool xtx_pcie_off = [&] {
+            const char* po = std::getenv("STRATA_PCIE_OFF");
+            return o.pcie_frac == 0.0 && !o.pcie_frac_auto && o.peer_device < 0 && adapt_fetch() == 0 &&
+                   !(po != nullptr && po[0] == '0');
+        }();
+        ver.set_pcie_off(xtx_pcie_off);
+        for (int st = 0; st < n_stages && n_stages > 1; ++st) {
+            stage_ver(st).set_pcie_off(xtx_pcie_off);
+            if (pipe) stage_ver_p(st, 1).set_pcie_off(xtx_pcie_off);
+        }
+        if (xtx_pcie_off) std::fprintf(stderr, "strata generate: --pcie-frac 0: the verify windows skip the PCIe share path\n");
         // --pipeline-windows 2: stage 0's GDN state before a speculative commit, restored when the guess was wrong.
         // Window W reads the state its snapshot must hold and no window writes it (only commits do), so it is copied
         // on a side stream while W runs, into the buffer of W's parity, and only W's speculative commit waits for it
@@ -17806,7 +17821,7 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_freq") req_penalty_freq = fv;
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
-                    else if (key == "pcie_frac") { req_pcie_frac = std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }
+                    else if (key == "pcie_frac") { req_pcie_frac = xtx_pcie_off ? 0.0 : std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }   // xtx F04: held at 0 while the PCIe path is skipped
                     else if (key == "spec_min_p") { req_spec_min_p = std::clamp((double) fv, 0.0, 1.0); req_min_p_set = true; }
                     else if (key == "draft") req_draft = tok.substr(eq + 1);
                     else if (key == "pipe") req_pipe = std::max(0.0, (double) fv);
