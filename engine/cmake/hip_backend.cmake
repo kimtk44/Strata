@@ -105,6 +105,13 @@ endif()
 if(CMAKE_HIP_ARCHITECTURES MATCHES "gfx11")
   target_compile_definitions(strata_hip_runtime INTERFACE STRATA_WMMA_GFX11=1)
 endif()
+# xtx F02 (nicejunjie/Strata-rdna3 3557322d): opt-in build switch (default OFF, so the default engine is upstream's): every
+# __shfl_xor_sync of a gfx11 target becomes a DPP row_xmask / v_permlanex16 exchange (the same butterfly partner, so the
+# same bits in converged code) instead of ds_bpermute's LDS round trip.  A device-code switch, so a build option, not an env.
+option(STRATA_DPP_SHFL "gfx11: xor shuffles by DPP / permlanex16 instead of ds_bpermute (opt-in)" OFF)
+if(STRATA_DPP_SHFL)
+  target_compile_definitions(strata_hip_runtime INTERFACE STRATA_DPP_SHFL_BUILD=1)
+endif()
 target_link_libraries(strata_hip_runtime INTERFACE hip::host)
 # The shim renames the CUDA runtime to HIP, force-included into every host and device source. On Windows the host
 # compiler is ROCm's clang++ too (tools/hip/build_windows.bat: CMake refuses to mix cl.exe with Clang HIP), which takes

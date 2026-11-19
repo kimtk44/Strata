@@ -7,6 +7,8 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/quant/dequant.hpp"   // xtx F02 (404247f8): other hc formats dequantized for STRATA_GR_RDNA_Q8's int8 copies
+#include "strata/quant/types.hpp"
 
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -101,6 +103,9 @@ bool hc_q8_name(const std::string& name) {
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
+// xtx F02 (e25a7b45): STRATA_GR_RDNA_Q8=1 builds int8 + fp16-scale hc copies only for the RDNA read (STRATA_GR_RDNA=1, gfx11)
+// (not together with STRATA_HC_Q8: its Q8_0 read wins in fused_gr_read_multi, so the copies would be unused)
+bool gr_rdna_q8_build() { return !hc_q8_env() && strata::kernels::rdna_gr_q8_requested() && strata::kernels::rdna_gr_enabled(); }
 // S25: the GGUF keeps the inject rows as F32 - quantized here to Q8_0 (ggml's reference rounding) so the Q8_0 read
 // covers every hc projection
 uint16_t half_bits(float f) {
@@ -123,6 +128,16 @@ uint16_t half_bits(float f) {
     const uint32_t rem = m & 0x1fffu;
     if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) ++h;
     return (uint16_t) (sign | h);
+}
+float half_to_float(uint16_t h) {   // xtx F02 (e25a7b45)
+    const uint32_t sign = (uint32_t) (h & 0x8000u) << 16;
+    uint32_t e = (h >> 10) & 0x1fu, m = h & 0x3ffu, x;
+    if (e == 0) {
+        if (m == 0) x = sign;
+        else { int s = -1; do { m <<= 1; ++s; } while (!(m & 0x400u)); x = sign | ((uint32_t) (127 - 15 - s) << 23) | ((m & 0x3ffu) << 13); }
+    } else if (e == 31) x = sign | 0x7f800000u | (m << 13);
+    else x = sign | ((e - 15 + 127) << 23) | (m << 13);
+    float f; std::memcpy(&f, &x, 4); return f;
 }
 std::vector<uint8_t> q8_0_of(const float* x, uint64_t n) {
     std::vector<uint8_t> out((size_t) (n / 32 * 34));
@@ -535,6 +550,73 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     allocated += alloc_bytes(bytes);
                     strata::core::manifest::instance().tensors("dense_hc_q8_copy", f32_inject ? "F32->Q8_0" : "Q8_0", 1, bytes);
                 }
+            // xtx F02 (e25a7b45, 404247f8) STRATA_GR_RDNA=1 + STRATA_GR_RDNA_Q8=1: int8 + fp16-scale copies of the hc
+            // down/up projections (and the final mixer's) for the RDNA read (rdna_gr.cu layout): the GGUF's Q8_0 as stored,
+            // BF16 quantized per 32 on the stored fp16 scale, any other format the quant layer dequantizes likewise.
+            // Only this stage's layers (as STRATA_HC_Q8's copies); the inject rows stay BF16.
+            if (gr_rdna_q8_build())
+                for (const auto& tensor : gguf.tensors()) {
+                    const bool other = tensor.type != 8 && tensor.type != 30 &&
+                                       strata::quant::can_dequant((strata::quant::Type) tensor.type) &&
+                                       strata::quant::type_info((int) tensor.type) != nullptr &&
+                                       strata::quant::type_info((int) tensor.type)->blck > 0;
+                    if ((tensor.type != 8 && tensor.type != 30 && !other) || !hc_q8_name(tensor.name) || tensor.shape.size() != 2 ||
+                        tensor.name.ends_with("_inject.weight") || outside(tensor.name) || !in_range(tensor.name))
+                        continue;
+                    auto found = table.table_.find(tensor.name);
+                    if (found == table.table_.end() || found->second.hc_r8 != nullptr) continue;
+                    auto& ref = found->second;
+                    const uint64_t n0 = tensor.shape[0], n1 = tensor.shape[1], n = n0 * n1;
+                    if (n0 != (uint64_t) ref.ne0 || n1 != (uint64_t) ref.ne1 || n0 % 32 != 0) {
+                        err = "native dense (STRATA_GR_RDNA_Q8): incompatible matrix " + tensor.name; return false;
+                    }
+                    const uint64_t soff = (n + 255) / 256 * 256, bytes = soff + n / 32 * 2;
+                    std::vector<uint8_t> host((size_t) bytes, 0);
+                    int8_t* q = (int8_t*) host.data();
+                    uint16_t* sc = (uint16_t*) (host.data() + soff);
+                    const uint8_t* src = (const uint8_t*) gguf.tensor_data(tensor);
+                    std::vector<float> deq;
+                    if (other) {
+                        const size_t rb = strata::quant::row_bytes((int) tensor.type, (int64_t) n0);
+                        if (rb == 0) { err = "native dense (STRATA_GR_RDNA_Q8): block size " + tensor.name; return false; }
+                        deq.resize((size_t) n);
+                        for (uint64_t r = 0; r < n1; ++r)
+                            if (!strata::quant::dequant_row((strata::quant::Type) tensor.type, src + r * rb, deq.data() + r * n0, (int64_t) n0)) {
+                                err = "native dense (STRATA_GR_RDNA_Q8): cannot dequantize " + tensor.name; return false;
+                            }
+                    }
+                    for (uint64_t b = 0; b < n / 32; ++b) {
+                        if (tensor.type == 8) {                       // Q8_0: fp16 d + 32 int8, as stored
+                            std::memcpy(&sc[b], src + b * 34, 2);
+                            std::memcpy(q + b * 32, src + b * 34 + 2, 32);
+                        } else {                                      // BF16 / other: quantized per 32 on the stored fp16 scale
+                            float x[32], amax = 0.0f;
+                            for (int j = 0; j < 32; ++j) {
+                                if (other) x[j] = deq[(size_t) (b * 32 + j)];
+                                else {
+                                    uint16_t h; std::memcpy(&h, src + (b * 32 + j) * 2, 2);
+                                    const uint32_t u = (uint32_t) h << 16; std::memcpy(&x[j], &u, 4);
+                                }
+                                amax = (std::max)(amax, std::fabs(x[j]));
+                            }
+                            const uint16_t hb = half_bits(amax / 127.0f);
+                            sc[b] = hb;
+                            const float d = half_to_float(hb), id = d != 0.0f ? 1.0f / d : 0.0f;
+                            for (int j = 0; j < 32; ++j) {
+                                const long v = std::lround(x[j] * id);
+                                q[b * 32 + j] = (int8_t) (v > 127 ? 127 : v < -127 ? -127 : v);
+                            }
+                        }
+                    }
+                    void* p = nullptr;
+                    if (cudaMalloc(&p, bytes) != cudaSuccess || cudaMemcpy(p, host.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                        err = "native dense (STRATA_GR_RDNA_Q8) upload " + tensor.name; return false;
+                    }
+                    ref.hc_r8 = p;
+                    weights_.push_back(p);
+                    hc_q8_bytes += bytes;
+                    allocated += alloc_bytes(bytes);
+                }
         }
         if (hc_q8_env()) {
             // a bf16 pack stores no Q8_0 copy: quantize the layers' down / up projections. A row the arena kept
@@ -573,10 +655,12 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 err = "native dense (STRATA_HC_Q8): quantizing the projections failed"; return false;
             }
         }
-        if (hc_q8_env()) {   // the scratches of hc_bf16_view (rows without a bf16 copy), here and not on first use
+        // the scratches of hc_bf16_view (rows without a bf16 copy), here and not on first use; xtx F02: also for the r8-only
+        // rows of STRATA_GR_RDNA_Q8
+        if (hc_q8_env() || gr_rdna_q8_build()) {
             uint64_t elems = 0;
             for (const auto& [name, ref] : table.table_)
-                if (ref.hc_q8 != nullptr && ref.data == nullptr) elems = (std::max)(elems, (uint64_t) ref.elements);
+                if ((ref.hc_q8 != nullptr || ref.hc_r8 != nullptr) && ref.data == nullptr) elems = (std::max)(elems, (uint64_t) ref.elements);
             int dev = 0;
             if (elems != 0 && cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64 && g_hc_scratch[dev][0][0] == nullptr) {
                 for (int c = 0; c < 2; ++c)
@@ -670,7 +754,7 @@ bool NativeDense::add_hc_skip(const std::string& pack_dir, std::set<std::string>
 
 const uint16_t* NativeDense::hc_bf16_view(const WeightRef& w, void* stream, int slot, int cls) {
     if (w.data != nullptr) return (const uint16_t*) w.data;
-    if (w.hc_q8 == nullptr) return nullptr;
+    if (w.hc_q8 == nullptr && w.hc_r8 == nullptr) return nullptr;   // xtx F02: or STRATA_GR_RDNA_Q8's int8 copy
     // the device's scratch (allocated at load, one pair per device): the prompt path and the single-token read run one
     // after the other on a device, and each use is stream-ordered after the previous GEMM that read the slot
     int dev = 0;
@@ -679,7 +763,8 @@ const uint16_t* NativeDense::hc_bf16_view(const WeightRef& w, void* stream, int 
     if (buf == nullptr) return nullptr;
     // the prompt path: the scratch may still be read by a GEMM another stream enqueued (batch serving: several slots' prompts)
     if (cls == 0 && g_hc_ev_set[dev][slot]) cudaStreamWaitEvent((cudaStream_t) stream, g_hc_ev[dev][slot], 0);
-    strata::kernels::fused_gr_dequant_q8_0((const uint8_t*) w.hc_q8, (uint16_t*) buf, w.elements / 32, stream);
+    if (w.hc_q8 != nullptr) strata::kernels::fused_gr_dequant_q8_0((const uint8_t*) w.hc_q8, (uint16_t*) buf, w.elements / 32, stream);
+    else strata::kernels::rdna_r8_to_bf16((const int8_t*) w.hc_r8, (uint16_t*) buf, (long long) w.elements, stream);
     return (const uint16_t*) buf;
 }
 

@@ -1632,6 +1632,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.q8_down = (const uint8_t*) wd[half]->hc_q8; a.q8_up = (const uint8_t*) wu[half]->hc_q8;
                 a.q8_inject = (const uint8_t*) wi[half]->hc_q8;
                 a.s_down = wd[half]->q8_scale; a.s_up = wu[half]->q8_scale;
+                // xtx F02 (e25a7b45): STRATA_GR_RDNA_Q8's int8 copies (null otherwise)
+                a.r8_down = (const int8_t*) wd[half]->hc_r8; a.r8_up = (const int8_t*) wu[half]->hc_r8;
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
                 if (qcnt_ != nullptr) {   // S26 STRATA_QFUSE: the consumer's q8_1 image written by the read itself
@@ -1640,7 +1642,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     else if (strata::kernels::cpu::expert_layout().native) a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
                 }
             }
-            if (strata::kernels::fused_gr_read_persist(fa, n, cs)) return false;   // STRATA_HC_PERSIST=1; q8_mixed is never set there
+            // xtx F02: the persistent read takes bf16 rows only - not the r8-only rows of STRATA_GR_RDNA_Q8
+            if (fa[0].r8_down == nullptr && strata::kernels::fused_gr_read_persist(fa, n, cs)) return false;   // STRATA_HC_PERSIST=1; q8_mixed is never set there
             return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
@@ -1739,7 +1742,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
                 strata::dispatch::notef("gdn layer: side_gates=%ld side_proj=%ld df_branch=%ld", (long) sidem, (long) side_proj, (long) br);
                 strata::dispatch::notef("gdn layer: conv+ab fused=%ld batch_rows=%ld", (long) fuse_ab, (long) batch_rec_);
-                if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
+                // xtx F02 (9ea97232) STRATA_RDNA_PAIR: q/k/v and z (the same input) in one launch when they share an RDNA
+                // format and mm() would take native_mmvq for both (bitwise the two calls); false: nothing launched
+                auto il_path = [&](const WeightRef* w, int n_out) {
+                    return g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, n_out);
+                };
+                const bool z_paired = !side_proj && !br && wqkv->native_type == wg->native_type && !il_path(wqkv, (int) C) &&
+                    !il_path(wg, (int) ZV) &&
+                    strata::kernels::rdna_mmvq_pair(wqkv->native_type, wqkv->native_data, wg->native_data, xq_,
+                                                    qkv + (size_t) tb * C, z_ + (size_t) tb * ZV, (int) N, (int) C,
+                                                    (int) ZV, n, cs);
+                if (!side_proj && !z_paired) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
@@ -1772,7 +1785,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
-                if (!side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                if (!side_proj && !z_paired) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
                 stamp(l, 5, grp);
                 if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
                     err = "verify: the gate projection's branch could not join";
