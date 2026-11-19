@@ -2867,13 +2867,18 @@ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn
     // or STRATA_HC_REQ8 (int8 codes in w_down) read, which keep their own kernels.  Another summation order.
     if (a[0].q8_down == nullptr && a[0].s_down == nullptr && a[0].s_up == nullptr && rdna_gr_enabled() &&
         ((a[0].r8_down != nullptr && a[0].r8_up != nullptr) || (a[0].w_down != nullptr && a[0].w_up != nullptr))) {
-        rdna_gr_read_multi(a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0);
+        // xtx F03 (88ab4687): m.a - q8_mixed set only when every token has one; the RDNA tail needs the counters too
+        // (upstream's counter-free STRATA_QFUSE_HC_LOCAL kernels are not the RDNA read's)
+        const bool rq8 = q8 && a[0].q8_cnt != nullptr;
+        if (!rq8)
+            for (int t = 0; t < n_tok; ++t) m.a[t].q8_mixed = nullptr;
+        rdna_gr_read_multi(m.a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0);
         const cudaError_t er = cudaGetLastError();
         if (er != cudaSuccess) {
             std::fprintf(stderr, "rdna_gr_read_multi: %s\n", cudaGetErrorString(er));
             std::exit(1);
         }
-        return false;   // no q8_1 image: the caller quantizes
+        return rq8;   // false: no q8_1 image, the caller quantizes
     }
     if (a[0].w_down == nullptr || a[0].w_up == nullptr) {
         if (a[0].q8_down == nullptr || a[0].q8_up == nullptr) {   // xtx F02: r8-only rows reach here only without the RDNA read
