@@ -39,3 +39,9 @@ hardening applied. Not hooked: the one-shot `--spec` program path (keeps the ful
 1. DONE 11-19: IQ3_S verified, packed, first 5 arms measured -> xtx-notes/bench-2026-11-19-iq3s.md
 2. gpu-lock both cards (user OK'd now), empty llama-swap, measure: 1 card upstream default / 1 card step-0 / 2-card layer split F04 off vs on.
 3. F02/F03 A/B (all env switches default off; build-time `-DSTRATA_DPP_SHFL=ON` separate dir). Order: all off = token-match baseline -> `STRATA_RDNA_Q6K=1` (+PAIR/IQ3S/KQ_ALL) -> `STRATA_GR_RDNA=1` (+`_Q8` look for "BF16 copies skipped", +`_A8`) -> `STRATA_GR_INJ_UP=1` -> `STRATA_GR_FUSED=1` on 1 card, no `--pipeline-windows 2` (grid barrier has no timeout, needs 168 blocks resident; fork saw a layer-26 hang) -> `STRATA_ROUTE_PUBLISH=1`, `STRATA_COMBINE_CPU=1` (+`STRATA_WAIT_FUSE=1`, `STRATA_MMVF_ROWS=1`), compare vs upstream `STRATA_FUSE_WAIT`/`FUSE_HITS`. Caveats: RDNA kernels change summation order (not bitwise), r8 hc copies not in the VRAM estimate and pure extra on layer split. Then F05/F09, F10 check, TP chain (F12 -> F13/F15/F16) with the fixes above.
+
+## Production (2026-11-20)
+- llama-swap entry `L-strata-flash-next-iq3s` (user applied patch + restart 00:4x KST; backup llama-swap.yaml.bak-20261120-pre-strata-iq3s; vault snapshot 229007b3).
+- Files ~/llm/strata-xtx/: strata-xtx-combined-be4a6e0c (branch xtx-combined), strata-iq3s.json (c2 + RDNA_Q6K/PAIR/GR_RDNA + spec-min-p 0.7, split 23), run-strata.sh (TERM stops server + engine; rehearsed: 1 s clean exit, VRAM freed).
+- Smoke via :8080: cold load 67 s, decode 76 tok/s, warm instant, /unload frees both cards. Not in any matrix set (evicts / is evicted by every other model).
+- Server code runs from ~/workspace/dev/strata-fork/terminal: do not switch that checkout's branch casually.
