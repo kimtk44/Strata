@@ -5058,7 +5058,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             std::fputc(10, route_dump);
         }
         // STRATA_PCIE_BALANCE (opt-in, #1548): the count comes from the measured CPU and GPU costs instead of the share
-        const bool pcie_ok = (d.pcie_num > 0 || d.pcie_model.on) && d.src->pcie_layer(d.layers);
+        // xtx F04: a verifier that skips the PCIe path (--pcie-frac 0) never gets PCIe groups, whatever pcie_num says
+        const bool pcie_ok = (d.pcie_num > 0 || d.pcie_model.on) && !d.plan->pcie_off && d.src->pcie_layer(d.layers);
         int m = pcie_ok ? d.pcie_model.pick(nmiss, (nmiss * d.pcie_num) >> 8) : 0;
         // STRATA_PCIE_MIN1 (opt-in): the share rounds to 0 for 1-2 misses per layer, so the PCIe lane idles on the typical
         // decode step; with >= 2 misses give it at least one (the last in routing order).  It only flies if its blob is

@@ -403,6 +403,7 @@ struct GpuPlanSink {
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
     /// holds the arena's device alias.
     int pcie_mode = 0;
+    bool pcie_off = false;                 ///< xtx F04: the verifier skips the PCIe path (--pcie-frac 0), so the pool must plan no PCIe groups
     int32_t cpu_jobs = 0;   ///< host only: the distinct experts the pool computes for the layer just published
 };
 

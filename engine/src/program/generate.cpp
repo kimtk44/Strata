@@ -12956,8 +12956,10 @@ int main(int argc, char** argv) {
         ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         // xtx F04 (nicejunjie deafb0d3 + 3557322d): --pcie-frac 0 means the pool plans no PCIe share, so every verify
         // window (one card, each layer-split stage, the pipelined odd windows) skips the flag-B wait, the fetch and the
-        // empty PCIe launch. Guards: no auto share, no peer device, no STRATA_ADAPT_FETCH (it rides the PCIe fetch),
-        // STRATA_PCIE_OFF=0 turns it off; while on, a request's own pcie_frac is held at 0 (below).
+        // empty PCIe launch. Guards: no auto share, no peer device, no STRATA_ADAPT_FETCH (already off at pcie_num 0;
+        // kept as defence), set_pcie_balance forces the path back on inside the verifier, STRATA_PCIE_OFF=0 turns it
+        // off; while on, the pool plans no PCIe groups for these verifiers (GpuPlanSink::pcie_off) and a request's own
+        // pcie_frac is held at 0 (below).
         const bool xtx_pcie_off = [&] {
             const char* po = std::getenv("STRATA_PCIE_OFF");
             return o.pcie_frac == 0.0 && !o.pcie_frac_auto && o.peer_device < 0 && adapt_fetch() == 0 &&
@@ -17821,7 +17823,13 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_freq") req_penalty_freq = fv;
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
-                    else if (key == "pcie_frac") { req_pcie_frac = xtx_pcie_off ? 0.0 : std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }   // xtx F04: held at 0 while the PCIe path is skipped
+                    else if (key == "pcie_frac") {   // xtx F04: held at 0 while the PCIe path is skipped
+                        if (xtx_pcie_off && fv > 0.0) {
+                            static bool warned = false;
+                            if (!warned) { warned = true; std::fprintf(stderr, "strata generate: request pcie_frac=%.2f ignored: started with --pcie-frac 0 (STRATA_PCIE_OFF=0 to allow; needed for calibrate)\n", (double) fv); }
+                        }
+                        req_pcie_frac = xtx_pcie_off ? 0.0 : std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true;
+                    }
                     else if (key == "spec_min_p") { req_spec_min_p = std::clamp((double) fv, 0.0, 1.0); req_min_p_set = true; }
                     else if (key == "draft") req_draft = tok.substr(eq + 1);
                     else if (key == "pipe") req_pipe = std::max(0.0, (double) fv);
